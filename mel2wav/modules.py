@@ -32,7 +32,7 @@ class Audio2Mel(nn.Module):
         sampling_rate=22050,
         n_mel_channels=80,
         mel_fmin=0.0,
-        mel_fmax=None,
+        mel_fmax=8000,
     ):
         super().__init__()
         ##############################################
@@ -65,69 +65,115 @@ class Audio2Mel(nn.Module):
         real_part, imag_part = fft.unbind(-1)
         magnitude = torch.sqrt(real_part ** 2 + imag_part ** 2)
         mel_output = torch.matmul(self.mel_basis, magnitude)
-        log_mel_spec = torch.log10(torch.clamp(mel_output, min=1e-5))
+        log_mel_spec = torch.log(torch.clamp(mel_output, min=1e-5))
+
         return log_mel_spec
 
 
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dilation=1):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.LeakyReLU(0.2),
-            nn.ReflectionPad1d(dilation),
-            WNConv1d(dim, dim, kernel_size=3, dilation=dilation),
-            nn.LeakyReLU(0.2),
-            WNConv1d(dim, dim, kernel_size=1),
-        )
-        self.shortcut = WNConv1d(dim, dim, kernel_size=1)
+class ResStack(nn.Module):
+    def __init__(self, channel, num_layers=4):
+        super(ResStack, self).__init__()
+
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LeakyReLU(0.2),
+                nn.ReflectionPad1d(3**i),
+                nn.utils.weight_norm(nn.Conv1d(channel, channel, kernel_size=3, dilation=3**i)),
+                nn.LeakyReLU(0.2),
+                nn.utils.weight_norm(nn.Conv1d(channel, channel, kernel_size=1)),
+            )
+            for i in range(num_layers)
+        ])
+
+        self.shortcuts = nn.ModuleList([
+            nn.utils.weight_norm(nn.Conv1d(channel, channel, kernel_size=1))
+            for i in range(num_layers)
+        ])
 
     def forward(self, x):
-        return self.shortcut(x) + self.block(x)
+        for block, shortcut in zip(self.blocks, self.shortcuts):
+            x = shortcut(x) + block(x)
+        return x
+
+    def remove_weight_norm(self):
+        for block, shortcut in zip(self.blocks, self.shortcuts):
+            nn.utils.remove_weight_norm(block[2])
+            nn.utils.remove_weight_norm(block[4])
+            nn.utils.remove_weight_norm(shortcut)
 
 
 class Generator(nn.Module):
-    def __init__(self, input_size, ngf, n_residual_layers):
-        super().__init__()
-        ratios = [8, 8, 2, 2]
-        self.hop_length = np.prod(ratios)
-        mult = int(2 ** len(ratios))
+    def __init__(self, mel_channel, *args, **kwargs):
+        super(Generator, self).__init__()
+        self.mel_channel = mel_channel
 
-        model = [
+        self.generator = nn.Sequential(
             nn.ReflectionPad1d(3),
-            WNConv1d(input_size, mult * ngf, kernel_size=7, padding=0),
-        ]
+            nn.utils.weight_norm(nn.Conv1d(mel_channel, 512, kernel_size=7, stride=1)),
 
-        # Upsample to raw audio scale
-        for i, r in enumerate(ratios):
-            model += [
-                nn.LeakyReLU(0.2),
-                WNConvTranspose1d(
-                    mult * ngf,
-                    mult * ngf // 2,
-                    kernel_size=r * 2,
-                    stride=r,
-                    padding=r // 2 + r % 2,
-                    output_padding=r % 2,
-                ),
-            ]
+            nn.LeakyReLU(0.2),
+            nn.utils.weight_norm(nn.ConvTranspose1d(512, 256, kernel_size=16, stride=8, padding=4)),
 
-            for j in range(n_residual_layers):
-                model += [ResnetBlock(mult * ngf // 2, dilation=3 ** j)]
+            ResStack(256, num_layers=5),
 
-            mult //= 2
+            nn.LeakyReLU(0.2),
+            nn.utils.weight_norm(nn.ConvTranspose1d(256, 128, kernel_size=16, stride=8, padding=4)),
 
-        model += [
+            ResStack(128, num_layers=7),
+
+            nn.LeakyReLU(0.2),
+            nn.utils.weight_norm(nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1)),
+
+            ResStack(64, num_layers=8),
+
+            nn.LeakyReLU(0.2),
+            nn.utils.weight_norm(nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2, padding=1)),
+
+            ResStack(32, num_layers=9),
+
             nn.LeakyReLU(0.2),
             nn.ReflectionPad1d(3),
-            WNConv1d(ngf, 1, kernel_size=7, padding=0),
+            nn.utils.weight_norm(nn.Conv1d(32, 1, kernel_size=7, stride=1)),
             nn.Tanh(),
-        ]
+        )
 
-        self.model = nn.Sequential(*model)
-        self.apply(weights_init)
+    def forward(self, mel):
+        mel = (mel + 5.0) / 5.0 # roughly normalize spectrogram
+        return self.generator(mel)
 
-    def forward(self, x):
-        return self.model(x)
+    def eval(self, inference=False):
+        super(Generator, self).eval()
+
+        # don't remove weight norm while validation in training loop
+        if inference:
+            self.remove_weight_norm()
+
+    def remove_weight_norm(self):
+        for idx, layer in enumerate(self.generator):
+            if len(layer.state_dict()) != 0:
+                try:
+                    nn.utils.remove_weight_norm(layer)
+                except:
+                    layer.remove_weight_norm()
+
+    def inference(self,
+                  mel: torch.Tensor,
+                  pad_steps: int = 10) -> torch.Tensor:
+        with torch.no_grad():
+            pad = torch.full((1, 80, pad_steps), -11.5129).to(mel.device)
+            mel = torch.cat((mel, pad), dim=2)
+            audio = self.forward(mel).squeeze()
+            audio = audio[:-(256 * pad_steps)]
+        return audio
+
+
+    @classmethod
+    def from_checkpoint(cls, file: str) -> 'Generator':
+        checkpoint = torch.load(file, map_location=torch.device('cpu'))
+        config = checkpoint['config']
+        model = Generator.from_config(config)
+        model.load_state_dict(config['g_model'])
+        return model
 
 
 class NLayerDiscriminator(nn.Module):
@@ -197,3 +243,23 @@ class Discriminator(nn.Module):
             results.append(disc(x))
             x = self.downsample(x)
         return results
+
+
+if __name__ == '__main__':
+    import time
+    model = Generator(80)
+    print(model)
+    x = torch.randn(3, 80, 1000)
+    start = time.time()
+    for i in range(1):
+        y = model(x)
+    dur = time.time() - start
+
+    print('dur ', dur)
+
+    #y = model(x)
+    #print(y.shape)
+    #assert y.shape == torch.Size([3, 1, 2560])
+
+    pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(pytorch_total_params)
