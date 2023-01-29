@@ -173,7 +173,12 @@ def main():
                     loss_feat += wt * F.l1_loss(D_fake[i][j], D_real[i][j].detach())
 
             netG.zero_grad()
-            (loss_G + args.lambda_feat * loss_feat).backward()
+
+            if epoch < 10:
+                F.l1_loss(s_t, s_pred_t).backward()
+            else:
+                (loss_G + args.lambda_feat * loss_feat).backward()
+
             optG.step()
 
             ######################
