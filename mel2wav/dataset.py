@@ -27,11 +27,11 @@ class AudioDataset(torch.utils.data.Dataset):
     spectrogram, audio pair.
     """
 
-    def __init__(self, training_files, segment_length, sampling_rate, augment=True):
+    def __init__(self, path, segment_length, sampling_rate, augment=True):
         self.sampling_rate = sampling_rate
         self.segment_length = segment_length
-        self.audio_files = files_to_list(training_files)
-        self.audio_files = [Path(training_files).parent / x for x in self.audio_files]
+        self.audio_files = list(Path(path).glob('**/*.wav'))
+        #self.audio_files = [Path(training_files).parent / x for x in self.audio_files]
         random.seed(1234)
         random.shuffle(self.audio_files)
         self.augment = augment
