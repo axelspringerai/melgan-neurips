@@ -175,7 +175,8 @@ def main():
             netG.zero_grad()
 
             if epoch < 10:
-                F.l1_loss(s_t, s_pred_t).backward()
+                s_pred_t = fft(x_pred_t.detach())
+                F.l1_loss(s_pred_t, s_t).backward()
             else:
                 (loss_G + args.lambda_feat * loss_feat).backward()
 
