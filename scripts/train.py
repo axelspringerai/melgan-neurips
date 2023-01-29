@@ -151,9 +151,10 @@ def main():
             for scale in D_real:
                 loss_D += F.relu(1 - scale[-1]).mean()
 
-            netD.zero_grad()
-            loss_D.backward()
-            optD.step()
+            if epoch > 5:
+                netD.zero_grad()
+                loss_D.backward()
+                optD.step()
 
             ###################
             # Train Generator #
@@ -176,7 +177,7 @@ def main():
 
             if epoch < 5:
                 s_pred_t = fft(x_pred_t)
-                (loss_G + args.lambda_feat * loss_feat + F.l1_loss(s_pred_t, s_t)).backward()
+                F.l1_loss(s_pred_t, s_t).backward()
             else:
                 (loss_G + args.lambda_feat * loss_feat).backward()
 
